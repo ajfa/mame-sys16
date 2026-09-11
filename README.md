@@ -77,9 +77,17 @@ found out along the way.
 ## Layout
 
     docs/STATUS.md      what works, what does not, and how it was found
+    docs/USING-GENIX.md where the software is, and using the machine
     patch/              the driver, as a file and as patches against MAME 0.289
     tools/              disk, filesystem and executable tools for this machine
     pack/               build and run scripts for Ubuntu
+
+## Using it
+
+[`docs/USING-GENIX.md`](docs/USING-GENIX.md) has the other half: links to where
+each piece of software is preserved, why the userland is a hybrid and what that
+means, what the machine is like once the shell is up, the two numbers that have
+to be right, and shutting down.
 
 ## Where a userland comes from
 
