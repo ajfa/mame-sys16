@@ -1,0 +1,68 @@
+From 6424a9d8173e4befff6a476aae0b62563de4bd8e Mon Sep 17 00:00:00 2001
+From: ajfa <3520832+ajfa@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:27:27 -0600
+Subject: [PATCH 4/6] sys16: make the option register configurable
+
+The firmware reads an option word at 0xfff400 that came from switches on
+the processor board.  Expose the two that matter, so the power-up
+diagnostics can be skipped: they take about a hundred emulated seconds and
+several of them fail for boards that are not emulated.
+---
+ src/mame/natsemi/sys16.cpp | 18 ++++++++++++++++--
+ 1 file changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/src/mame/natsemi/sys16.cpp b/src/mame/natsemi/sys16.cpp
+index bfec1105..2a3bf6b7 100644
+--- a/src/mame/natsemi/sys16.cpp
++++ b/src/mame/natsemi/sys16.cpp
+@@ -87,6 +87,7 @@ public:
+ 		, m_pit(*this, "pit")
+ 		, m_gtl(*this, "gtl")
+ 		, m_console(*this, "conport")
++		, m_opt(*this, "OPT")
+ 		, m_eprom(*this, "eprom")
+ 		, m_hdc_cpu(*this, "hdc_cpu")
+ 		, m_hd(*this, "hd%u", 0U)
+@@ -116,6 +117,7 @@ protected:
+ 
+ 	required_device<rs232_port_device> m_console;
+ 
++	required_ioport m_opt;
+ 	required_region_ptr<u16> m_eprom;
+ 	required_device<i8039_device> m_hdc_cpu;
+ 
+@@ -313,6 +315,16 @@ void sys16_state::hdc_mem(address_map &map)
+ }
+ 
+ static INPUT_PORTS_START(sys16)
++	PORT_START("OPT")
++	PORT_CONFNAME(0x0004, 0x0000, "Power-up diagnostics")
++	PORT_CONFSETTING(     0x0000, DEF_STR(Off))
++	PORT_CONFSETTING(     0x0004, DEF_STR(On))
++	PORT_CONFNAME(0x0800, 0x0000, "After power-up")
++	PORT_CONFSETTING(     0x0000, "Boot /vmunix")
++	PORT_CONFSETTING(     0x0800, "Stop in monitor")
++	PORT_CONFNAME(0x0100, 0x0100, "Floating point unit")
++	PORT_CONFSETTING(     0x0000, DEF_STR(No))
++	PORT_CONFSETTING(     0x0100, DEF_STR(Yes))
+ INPUT_PORTS_END
+ 
+ void sys16_state::sys16(machine_config &config)
+@@ -641,10 +653,12 @@ enum opt_mask : u16
+ 	OPT_GPIB  = 0xe000, // GPIB address
+ };
+ 
+-// TODO: change to dip switches?
+ u16 sys16_state::opt_r()
+ {
+-	return OPT_EMB | OPT_WORK | OPT_MOVSU | OPT_FPU | OPT_DIAG | OPT_ECHO;
++	// the rest are not settings a user has any reason to change: the
++	// extended memory board is always present here, MOVSU works, and the
++	// serial console is always echoed to the monitor
++	return OPT_EMB | OPT_WORK | OPT_MOVSU | OPT_ECHO | m_opt->read();
+ }
+ 
+ ROM_START(sys16)
+-- 
+2.34.1
+

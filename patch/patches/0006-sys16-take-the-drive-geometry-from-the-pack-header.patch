@@ -1,0 +1,136 @@
+From ccac5f73743fc60b3081e293612eaad6f4dd2ad8 Mon Sep 17 00:00:00 2001
+From: ajfa <3520832+ajfa@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 21:46:27 -0600
+Subject: [PATCH 6/6] sys16: take the drive geometry from the pack header
+
+The DCU is told a cylinder, head and sector, so the emulation needs the
+drive shape to reach the right place in the image.  That was pinned to the
+20 MB BASF the SYS16 shipped with, which meant any other drive from
+National's table needed a recompile.
+
+Sector 0 of every pack carries a disktab (uts/ns32000/sys/disk.h) naming
+the drive: the disk driver reads it at open time for the same reason, so
+reading it here is consistent with what the hardware was told when the pack
+was formatted.  Without a valid header the BASF values still apply.
+---
+ src/mame/natsemi/sys16.cpp | 49 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 44 insertions(+), 5 deletions(-)
+
+diff --git a/src/mame/natsemi/sys16.cpp b/src/mame/natsemi/sys16.cpp
+index 9e5be286..b6efcf11 100644
+--- a/src/mame/natsemi/sys16.cpp
++++ b/src/mame/natsemi/sys16.cpp
+@@ -1,5 +1,5 @@
+ // license:BSD-3-Clause
+-// copyright-holders:Patrick Mackinlay
++// copyright-holders:Patrick Mackinlay, ajfa
+ 
+ /*
+  * National Semiconductor SYS16 Multi-User Development System for the NS16000 Microprocessor Family
+@@ -197,17 +197,18 @@ private:
+ 		IOCB_RESID    = 27,
+ 	};
+ 
+-	// BASF 6172, the 20 MB Winchester the SYS16 shipped with
+-	// (see dcusize.c in the GENIX standalone sources)
++	// the BASF 6172 the SYS16 shipped with, used when a pack carries no
++	// header (see dcusize.c in the GENIX standalone sources)
+ 	static constexpr unsigned DCU_SECTORS = 24;   // per track
+ 	static constexpr unsigned DCU_HEADS   = 3;    // per cylinder
+-	static constexpr unsigned DCU_CYLS    = 614;
++	static constexpr u32 DCU_DMAGIC = 0x6d73'7000; // disktab magic, sector 0
+ 
+ 	static constexpr u32 IOCB_CHAINBIT = 0x8000'0000U;
+ 	static constexpr u8 IOCB_ES_DONE   = 0x80; // done with all IOCBs
+ 	static constexpr u8 IOCB_ES_CHAIN  = 0x40; // chain acknowledge
+ 	static constexpr u8 IOCB_ES_DRIVE  = 0x08; // drive check
+ 
++	void dcu_geometry(unsigned unit);
+ 	u8 dcu_r(offs_t offset);
+ 	void dcu_w(offs_t offset, u8 data);
+ 	TIMER_CALLBACK_MEMBER(dcu_complete);
+@@ -223,6 +224,8 @@ private:
+ 	bool m_dcu_selftest;
+ 	bool m_dcu_auxerr;
+ 	unsigned m_dcu_unit;
++	unsigned m_dcu_sectors[2];
++	unsigned m_dcu_heads[2];
+ 
+ 	u8 nmi_r() { return m_nmi; }
+ 	void dcr_w(u8 data);
+@@ -262,6 +265,8 @@ void sys16_state::machine_start()
+ 	save_item(NAME(m_dcu_selftest));
+ 	save_item(NAME(m_dcu_auxerr));
+ 	save_item(NAME(m_dcu_unit));
++	save_item(NAME(m_dcu_sectors));
++	save_item(NAME(m_dcu_heads));
+ }
+ 
+ void sys16_state::machine_reset()
+@@ -275,6 +280,8 @@ void sys16_state::machine_reset()
+ 	m_dcu_selftest = false;
+ 	m_dcu_auxerr = false;
+ 	m_dcu_unit = 0;
++	std::fill(std::begin(m_dcu_sectors), std::end(m_dcu_sectors), 0);
++	std::fill(std::begin(m_dcu_heads), std::end(m_dcu_heads), 0);
+ 	m_icu->ir_w<3>(1); // idle high
+ 
+ 	m_boot.select(0);
+@@ -405,6 +412,34 @@ bool sys16_state::dcu_unit_ok(unsigned unit) const
+ 	return (unit < 2) && m_hd[unit]->exists();
+ }
+ 
++void sys16_state::dcu_geometry(unsigned unit)
++{
++	if (m_dcu_sectors[unit])
++		return;
++
++	m_dcu_sectors[unit] = DCU_SECTORS;
++	m_dcu_heads[unit] = DCU_HEADS;
++
++	u8 header[512];
++	if (!m_hd[unit]->read(0, header))
++		return;
++
++	u32 const magic = header[0] | (u32(header[1]) << 8)
++			| (u32(header[2]) << 16) | (u32(header[3]) << 24);
++	if (magic != DCU_DMAGIC)
++		return;
++
++	unsigned const nsec = header[8] | (unsigned(header[9]) << 8);
++	unsigned const ntr = header[10] | (unsigned(header[11]) << 8);
++	if (nsec && ntr && nsec < 256 && ntr < 32)
++	{
++		m_dcu_sectors[unit] = nsec;
++		m_dcu_heads[unit] = ntr;
++		LOG("dcu unit %d: %d sectors of 512 per track, %d tracks per cylinder\n",
++				unit, nsec, ntr);
++	}
++}
++
+ u8 sys16_state::dcu_r(offs_t offset)
+ {
+ 	LOG("dcu_r %d (%s)\n", offset, machine().describe_context());
+@@ -496,6 +531,8 @@ bool sys16_state::dcu_execute()
+ 
+ 	case DCU_C_ASSDRIVE:
+ 		m_dcu_unit = arg >> 13;
++		if (dcu_unit_ok(m_dcu_unit))
++			dcu_geometry(m_dcu_unit);
+ 		return dcu_unit_ok(m_dcu_unit);
+ 
+ 	case DCU_C_SPECIFIC:
+@@ -550,7 +587,9 @@ bool sys16_state::dcu_transfer(u32 iocb)
+ 		}
+ 		else
+ 		{
+-			u32 lba = (u32(cylinder) * DCU_HEADS + head) * DCU_SECTORS + sector;
++			dcu_geometry(unit);
++			u32 lba = (u32(cylinder) * m_dcu_heads[unit] + head)
++					* m_dcu_sectors[unit] + sector;
+ 			u8 buffer[512];
+ 
+ 			LOG("dcu %s unit %d c/h/s %d/%d/%d count %d table 0x%06x\n",
+-- 
+2.34.1
+

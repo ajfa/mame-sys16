@@ -1,0 +1,26 @@
+From 0b37eebd2dcff2f552ded9670f3a1283d6341feb Mon Sep 17 00:00:00 2001
+From: ajfa <3520832+ajfa@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 18:40:28 -0600
+Subject: [PATCH 1/6] sys16: rename rs232 port tag (console collides with the
+ core -console option)
+
+---
+ src/mame/natsemi/sys16.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/mame/natsemi/sys16.cpp b/src/mame/natsemi/sys16.cpp
+index 88ac96f0..235139d8 100644
+--- a/src/mame/natsemi/sys16.cpp
++++ b/src/mame/natsemi/sys16.cpp
+@@ -85,7 +85,7 @@ public:
+ 		, m_ppi(*this, "ppi")
+ 		, m_pit(*this, "pit")
+ 		, m_gtl(*this, "gtl")
+-		, m_console(*this, "console")
++		, m_console(*this, "conport")
+ 		, m_eprom(*this, "eprom")
+ 		, m_hdc_cpu(*this, "hdc_cpu")
+ 		, m_boot(*this, "boot")
+-- 
+2.34.1
+

@@ -1,0 +1,539 @@
+diff --git a/src/mame/natsemi/sys16.cpp b/src/mame/natsemi/sys16.cpp
+index 88ac96f0..b6efcf11 100644
+--- a/src/mame/natsemi/sys16.cpp
++++ b/src/mame/natsemi/sys16.cpp
+@@ -1,5 +1,5 @@
+ // license:BSD-3-Clause
+-// copyright-holders:Patrick Mackinlay
++// copyright-holders:Patrick Mackinlay, ajfa
+ 
+ /*
+  * National Semiconductor SYS16 Multi-User Development System for the NS16000 Microprocessor Family
+@@ -7,13 +7,21 @@
+  * Sources:
+  *  - NS16000 Databook, National Semiconductor Corporation, 1983 (OEE1894, DA-RRD35M94)
+  *
++ * Boots GENIX V.2 (National's port of AT&T UNIX System V Release 2) from
++ * the disk and runs it interactively on the serial console.
++ *
+  * TODO:
+- *  - gpib, printer ports
+- *  - sio/disk/tape boards
++ *  - gpib and printer ports
++ *  - tape control unit at 0xd00200
++ *  - the eight line serial board at 0xa00000, so no extra terminals and
++ *    therefore no multiuser mode
++ *  - the disk control unit is emulated at the level of its command
++ *    interface rather than its hardware: the board is a pair of AM2901 bit
++ *    slices running microcode out of RAM which was never dumped
+  *
+  * WIP:
+- *  - multiple startup diagnostic tests failing
+- *  - can exit and run monitor
++ *  - the power-up diagnostics for the boards above fail, as they should;
++ *    they are switched off by default in the machine configuration
+  *
+  *  p/f test                notes
+  *   p  0 - timer
+@@ -64,10 +72,11 @@
+ #include "bus/rs232/rs232.h"
+ 
+ // disk board
++#include "imagedev/harddriv.h"
+ #include "cpu/mcs48/mcs48.h"
+ #include "machine/i8243.h"
+ 
+-#define VERBOSE 0
++#define VERBOSE 1
+ #include "logmacro.h"
+ 
+ namespace {
+@@ -85,9 +94,11 @@ public:
+ 		, m_ppi(*this, "ppi")
+ 		, m_pit(*this, "pit")
+ 		, m_gtl(*this, "gtl")
+-		, m_console(*this, "console")
++		, m_console(*this, "conport")
++		, m_opt(*this, "OPT")
+ 		, m_eprom(*this, "eprom")
+ 		, m_hdc_cpu(*this, "hdc_cpu")
++		, m_hd(*this, "hd%u", 0U)
+ 		, m_boot(*this, "boot")
+ 	{
+ 	}
+@@ -114,12 +125,108 @@ protected:
+ 
+ 	required_device<rs232_port_device> m_console;
+ 
++	required_ioport m_opt;
+ 	required_region_ptr<u16> m_eprom;
+ 	required_device<i8039_device> m_hdc_cpu;
+ 
+ 	memory_view m_boot;
+ 
+ private:
++	// --- DCU (Mesa disk control unit, 0xd00000) ---------------------------
++	//
++	// Command-level emulation of the SYS16 disk board.  The real board is an
++	// INS8039 plus a pair of AM2901 bit slices running microcode out of RAM,
++	// so it is driven here at the level the drivers actually use: three
++	// argument bytes written to chan00/01/02, an opcode written to chan03,
++	// and a status byte polled at +8.  DC_START carries the address of an
++	// IOCB in main memory; the IOCB names the transfer and points at a table
++	// of physical page addresses, one long per 512-byte sector.
++	//
++	// Sources:
++	//  - GENIX V.2 uts/ns32000/sys/dcu.h, sys/disk.h and io/dc.c
++	//  - GENIX V.2 stand/ns32000/dcusaio.c (standalone driver for dcutest)
++	//  - GENIX 1 src/sys/dev/dcu.c and src/sys/stand/dcusaio.c
++
++	enum dcu_status : u8
++	{
++		DCU_READY    = 0x80, // command port is ready
++		DCU_ERINT    = 0x40, // error status latched
++		DCU_SELFTEST = 0x20, // executing self test
++		DCU_AUXERR   = 0x10, // illegal command
++	};
++
++	enum dcu_code : u8 // per-channel status code
++	{
++		DCU_BUSY  = 0,
++		DCU_ERROR = 1,
++		DCU_DONE  = 2,
++		DCU_IDLE  = 3,
++	};
++
++	enum dcu_opcode : u8
++	{
++		DCU_C_SELFTEST    = 0x16,
++		DCU_C_START       = 0x18,
++		DCU_C_ASSDRIVE    = 0x20,
++		DCU_C_ASSCYLINDER = 0x2e,
++		DCU_C_ASSBUFFER   = 0x42,
++		DCU_C_SETBURST    = 0x74,
++		DCU_C_SENSE       = 0x84,
++		DCU_C_DIAGREAD    = 0x8a,
++		DCU_C_DIAGWRITE   = 0xb2,
++		DCU_C_FORMAT      = 0xbc,
++		DCU_C_READ        = 0xde,
++		DCU_C_WRITE       = 0xe6,
++		DCU_C_SPECIFIC    = 0xe8,
++	};
++
++	// IOCB field offsets, counted from the address handed to DC_START
++	// (which is &dc_opcode, two bytes into the driver's struct)
++	enum dcu_iocb : unsigned
++	{
++		IOCB_OPCODE   = 0,
++		IOCB_DRIVEPAR = 2,
++		IOCB_COUNT    = 3,
++		IOCB_CYLINDER = 6,
++		IOCB_DRHDSEC  = 8,
++		IOCB_BUFFER   = 10,
++		IOCB_SENSE    = 14,
++		IOCB_ECC      = 18,
++		IOCB_CHAIN    = 22,
++		IOCB_STATUS   = 26,
++		IOCB_RESID    = 27,
++	};
++
++	// the BASF 6172 the SYS16 shipped with, used when a pack carries no
++	// header (see dcusize.c in the GENIX standalone sources)
++	static constexpr unsigned DCU_SECTORS = 24;   // per track
++	static constexpr unsigned DCU_HEADS   = 3;    // per cylinder
++	static constexpr u32 DCU_DMAGIC = 0x6d73'7000; // disktab magic, sector 0
++
++	static constexpr u32 IOCB_CHAINBIT = 0x8000'0000U;
++	static constexpr u8 IOCB_ES_DONE   = 0x80; // done with all IOCBs
++	static constexpr u8 IOCB_ES_CHAIN  = 0x40; // chain acknowledge
++	static constexpr u8 IOCB_ES_DRIVE  = 0x08; // drive check
++
++	void dcu_geometry(unsigned unit);
++	u8 dcu_r(offs_t offset);
++	void dcu_w(offs_t offset, u8 data);
++	TIMER_CALLBACK_MEMBER(dcu_complete);
++	bool dcu_execute();
++	bool dcu_transfer(u32 iocb);
++	bool dcu_unit_ok(unsigned unit) const;
++
++	required_device_array<harddisk_image_device, 2> m_hd;
++	emu_timer *m_dcu_timer;
++	u8 m_dcu_chan[3];  // argument bytes
++	u8 m_dcu_op;       // opcode being executed
++	u8 m_dcu_code;     // channel 0 status code
++	bool m_dcu_selftest;
++	bool m_dcu_auxerr;
++	unsigned m_dcu_unit;
++	unsigned m_dcu_sectors[2];
++	unsigned m_dcu_heads[2];
++
+ 	u8 nmi_r() { return m_nmi; }
+ 	void dcr_w(u8 data);
+ 
+@@ -149,7 +256,17 @@ void sys16_state::init()
+ 
+ void sys16_state::machine_start()
+ {
++	m_dcu_timer = timer_alloc(FUNC(sys16_state::dcu_complete), this);
++
+ 	save_item(NAME(m_dcr));
++	save_item(NAME(m_dcu_chan));
++	save_item(NAME(m_dcu_op));
++	save_item(NAME(m_dcu_code));
++	save_item(NAME(m_dcu_selftest));
++	save_item(NAME(m_dcu_auxerr));
++	save_item(NAME(m_dcu_unit));
++	save_item(NAME(m_dcu_sectors));
++	save_item(NAME(m_dcu_heads));
+ }
+ 
+ void sys16_state::machine_reset()
+@@ -157,6 +274,16 @@ void sys16_state::machine_reset()
+ 	m_dcr = 0;
+ 	m_nmi = 6; // HACK: pass diagnostic
+ 
++	std::fill(std::begin(m_dcu_chan), std::end(m_dcu_chan), 0);
++	m_dcu_op = 0;
++	m_dcu_code = DCU_IDLE;
++	m_dcu_selftest = false;
++	m_dcu_auxerr = false;
++	m_dcu_unit = 0;
++	std::fill(std::begin(m_dcu_sectors), std::end(m_dcu_sectors), 0);
++	std::fill(std::begin(m_dcu_heads), std::end(m_dcu_heads), 0);
++	m_icu->ir_w<3>(1); // idle high
++
+ 	m_boot.select(0);
+ }
+ 
+@@ -168,10 +295,14 @@ template <unsigned ST> void sys16_state::cpu_map(address_map &map)
+ 		m_boot[0](0x00'0000, 0x00'9fff).rom().region("eprom", 0);
+ 		m_boot[1](0x00'0000, 0x03'ffff).ram();
+ 
+-		map(0x04'0000, 0x3f'ffff).noprw();
++		// memory boards: fill the rest of the CPU's 4 MB
++		map(0x04'0000, 0x3f'ffff).ram();
+ 
+ 		map(0xa0'0c00, 0xa0'1bff).ram(); // serial board ram?
+ 
++		// disk control unit
++		map(0xd0'0000, 0xd0'001f).umask16(0x00ff).rw(FUNC(sys16_state::dcu_r), FUNC(sys16_state::dcu_w));
++
+ 		map(0xe0'0000, 0xe0'9fff).rom().region("eprom", 0);
+ 
+ 		// extended memory board control regs
+@@ -199,6 +330,16 @@ void sys16_state::hdc_mem(address_map &map)
+ }
+ 
+ static INPUT_PORTS_START(sys16)
++	PORT_START("OPT")
++	PORT_CONFNAME(0x0004, 0x0000, "Power-up diagnostics")
++	PORT_CONFSETTING(     0x0000, DEF_STR(Off))
++	PORT_CONFSETTING(     0x0004, DEF_STR(On))
++	PORT_CONFNAME(0x0800, 0x0000, "After power-up")
++	PORT_CONFSETTING(     0x0000, "Boot /vmunix")
++	PORT_CONFSETTING(     0x0800, "Stop in monitor")
++	PORT_CONFNAME(0x0100, 0x0100, "Floating point unit")
++	PORT_CONFSETTING(     0x0000, DEF_STR(No))
++	PORT_CONFSETTING(     0x0100, DEF_STR(Yes))
+ INPUT_PORTS_END
+ 
+ void sys16_state::sys16(machine_config &config)
+@@ -228,6 +369,8 @@ void sys16_state::sys16(machine_config &config)
+ 	m_pit->out_handler<2>().set(m_icu, FUNC(ns32202_device::ir_w<1>));
+ 
+ 	SCN2651(config, m_pci, 1.8432_MHz_XTAL); // INS2651N
++	m_pci->rxrdy_handler().set(m_icu, FUNC(ns32202_device::ir_w<9>)).invert();
++	m_pci->txrdy_handler().set(m_icu, FUNC(ns32202_device::ir_w<10>)).invert();
+ 
+ 	RS232_PORT(config, m_console, default_rs232_devices, "terminal");
+ 	m_console->rxd_handler().set(m_pci, FUNC(scn2651_device::rxd_w));
+@@ -253,10 +396,268 @@ void sys16_state::sys16(machine_config &config)
+ 	// AM25LS2569PC (x2) binary counter
+ 	// N9403N (x2) 64-bit fifo buffer memory
+ 
++	HARDDISK(config, m_hd[0], 0);
++	HARDDISK(config, m_hd[1], 0);
++
+ 	I8039(config, m_hdc_cpu, 11_MHz_XTAL);
+ 	m_hdc_cpu->set_addrmap(AS_PROGRAM, &sys16_state::hdc_mem);
+ }
+ 
++// ---------------------------------------------------------------------------
++// DCU: Mesa disk control unit
++// ---------------------------------------------------------------------------
++
++bool sys16_state::dcu_unit_ok(unsigned unit) const
++{
++	return (unit < 2) && m_hd[unit]->exists();
++}
++
++void sys16_state::dcu_geometry(unsigned unit)
++{
++	if (m_dcu_sectors[unit])
++		return;
++
++	m_dcu_sectors[unit] = DCU_SECTORS;
++	m_dcu_heads[unit] = DCU_HEADS;
++
++	u8 header[512];
++	if (!m_hd[unit]->read(0, header))
++		return;
++
++	u32 const magic = header[0] | (u32(header[1]) << 8)
++			| (u32(header[2]) << 16) | (u32(header[3]) << 24);
++	if (magic != DCU_DMAGIC)
++		return;
++
++	unsigned const nsec = header[8] | (unsigned(header[9]) << 8);
++	unsigned const ntr = header[10] | (unsigned(header[11]) << 8);
++	if (nsec && ntr && nsec < 256 && ntr < 32)
++	{
++		m_dcu_sectors[unit] = nsec;
++		m_dcu_heads[unit] = ntr;
++		LOG("dcu unit %d: %d sectors of 512 per track, %d tracks per cylinder\n",
++				unit, nsec, ntr);
++	}
++}
++
++u8 sys16_state::dcu_r(offs_t offset)
++{
++	LOG("dcu_r %d (%s)\n", offset, machine().describe_context());
++
++	switch (offset)
++	{
++	case 0: case 1: case 2: case 3:
++		// reading chan01 is the SETDAFF strobe that write-enables the drives;
++		// the drivers ignore the value returned
++		return 0;
++
++	case 4: // immediate status
++		{
++			u8 status = DCU_READY | (m_dcu_code << 2) | DCU_IDLE;
++
++			if (m_dcu_selftest)
++				status |= DCU_SELFTEST;
++			if (m_dcu_auxerr)
++				status |= DCU_AUXERR;
++
++			return status;
++		}
++
++	default:
++		return 0;
++	}
++}
++
++void sys16_state::dcu_w(offs_t offset, u8 data)
++{
++	LOG("dcu_w %d 0x%02x (%s)\n", offset, data, machine().describe_context());
++
++	switch (offset)
++	{
++	case 0: case 1: case 2:
++		m_dcu_chan[offset] = data;
++		break;
++
++	case 3: // opcode: writing it starts the command
++		m_dcu_op = data;
++		m_dcu_code = DCU_BUSY;
++		m_dcu_auxerr = false;
++		// the real board takes milliseconds; anything non-zero is enough to
++		// keep the drivers' poll loops honest
++		m_dcu_timer->adjust(attotime::from_usec(50));
++		break;
++
++	case 4: // any write acknowledges the completed operation
++		m_dcu_code = DCU_IDLE;
++		m_icu->ir_w<3>(1);
++		break;
++
++	case 8: // error acknowledge
++		m_dcu_auxerr = false;
++		break;
++
++	default:
++		break;
++	}
++}
++
++TIMER_CALLBACK_MEMBER(sys16_state::dcu_complete)
++{
++	bool const ok = dcu_execute();
++
++	m_dcu_code = ok ? DCU_DONE : DCU_ERROR;
++
++	// ICU line 3 is edge triggered on the falling edge
++	m_icu->ir_w<3>(0);
++}
++
++bool sys16_state::dcu_execute()
++{
++	u32 const arg = m_dcu_chan[0] | (u32(m_dcu_chan[1]) << 8) | (u32(m_dcu_chan[2]) << 16);
++
++	LOG("dcu command 0x%02x arg 0x%06x\n", m_dcu_op, arg);
++
++	switch (m_dcu_op)
++	{
++	case DCU_C_SELFTEST:
++		m_dcu_selftest = false;
++		return true;
++
++	case DCU_C_SETBURST:     // burst and interleave: accepted as given
++	case DCU_C_ASSCYLINDER:  // superseded by the cylinder field of the IOCB
++	case DCU_C_ASSBUFFER:
++	case DCU_C_SENSE:
++		return true;
++
++	case DCU_C_ASSDRIVE:
++		m_dcu_unit = arg >> 13;
++		if (dcu_unit_ok(m_dcu_unit))
++			dcu_geometry(m_dcu_unit);
++		return dcu_unit_ok(m_dcu_unit);
++
++	case DCU_C_SPECIFIC:
++		// sub-function in the second argument byte: 0x41 write enable,
++		// 0x04 rezero, 0x03 seek.  Nothing here needs a head to move.
++		return dcu_unit_ok(m_dcu_unit);
++
++	case DCU_C_START:
++		return dcu_transfer(arg);
++
++	default:
++		LOG("dcu unimplemented command 0x%02x\n", m_dcu_op);
++		m_dcu_auxerr = true;
++		return false;
++	}
++}
++
++bool sys16_state::dcu_transfer(u32 iocb)
++{
++	address_space &space = m_cpu->space(AS_PROGRAM);
++	bool ok = true;
++
++	// follow the IOCB chain until a link without the valid bit
++	while (true)
++	{
++		u8 const opcode = space.read_byte(iocb + IOCB_OPCODE);
++		u8 const count = space.read_byte(iocb + IOCB_COUNT);
++		u16 const cylinder = space.read_byte(iocb + IOCB_CYLINDER)
++				| (u16(space.read_byte(iocb + IOCB_CYLINDER + 1)) << 8);
++		u16 const drhdsec = space.read_byte(iocb + IOCB_DRHDSEC)
++				| (u16(space.read_byte(iocb + IOCB_DRHDSEC + 1)) << 8);
++
++		u32 table = 0;
++		for (unsigned i = 0; i < 4; i++)
++			table |= u32(space.read_byte(iocb + IOCB_BUFFER + i)) << (i * 8);
++
++		u32 chain = 0;
++		for (unsigned i = 0; i < 4; i++)
++			chain |= u32(space.read_byte(iocb + IOCB_CHAIN + i)) << (i * 8);
++
++		unsigned const unit = drhdsec >> 13;
++		unsigned const head = (drhdsec >> 8) & 0x1f;
++		unsigned const sector = drhdsec & 0xff;
++
++		u8 resid = count;
++		u8 ending = 0;
++
++		if (!dcu_unit_ok(unit))
++		{
++			ending = IOCB_ES_DRIVE;
++			ok = false;
++		}
++		else
++		{
++			dcu_geometry(unit);
++			u32 lba = (u32(cylinder) * m_dcu_heads[unit] + head)
++					* m_dcu_sectors[unit] + sector;
++			u8 buffer[512];
++
++			LOG("dcu %s unit %d c/h/s %d/%d/%d count %d table 0x%06x\n",
++					(opcode == DCU_C_WRITE) ? "write" : "read",
++					unit, cylinder, head, sector, count, table);
++
++			for (unsigned i = 0; i < count; i++, lba++)
++			{
++				// one physical page address per sector
++				u32 addr = 0;
++				for (unsigned b = 0; b < 4; b++)
++					addr |= u32(space.read_byte(table + i * 4 + b)) << (b * 8);
++
++				if (opcode == DCU_C_WRITE || opcode == DCU_C_FORMAT)
++				{
++					if (opcode == DCU_C_FORMAT)
++						std::fill(std::begin(buffer), std::end(buffer), 0);
++					else
++						for (unsigned b = 0; b < 512; b++)
++							buffer[b] = space.read_byte(addr + b);
++
++					if (!m_hd[unit]->write(lba, buffer))
++					{
++						ok = false;
++						ending = IOCB_ES_DRIVE;
++						break;
++					}
++				}
++				else
++				{
++					if (!m_hd[unit]->read(lba, buffer))
++					{
++						ok = false;
++						ending = IOCB_ES_DRIVE;
++						break;
++					}
++
++					for (unsigned b = 0; b < 512; b++)
++						space.write_byte(addr + b, buffer[b]);
++				}
++
++				resid--;
++			}
++		}
++
++		space.write_byte(iocb + IOCB_RESID, resid);
++
++		if (!ok)
++		{
++			space.write_byte(iocb + IOCB_STATUS, ending);
++			// leave sense zero: the drivers read it as "no further detail"
++			break;
++		}
++
++		if (chain & IOCB_CHAINBIT)
++		{
++			space.write_byte(iocb + IOCB_STATUS, IOCB_ES_CHAIN);
++			iocb = chain & ~IOCB_CHAINBIT;
++			continue;
++		}
++
++		space.write_byte(iocb + IOCB_STATUS, IOCB_ES_DONE);
++		break;
++	}
++
++	return ok;
++}
++
+ enum nmi_mask : u8
+ {
+ 	NMI_POWER  = 0x01, // power fail
+@@ -299,10 +700,12 @@ enum opt_mask : u16
+ 	OPT_GPIB  = 0xe000, // GPIB address
+ };
+ 
+-// TODO: change to dip switches?
+ u16 sys16_state::opt_r()
+ {
+-	return OPT_WORK | OPT_MOVSU | OPT_FPU | OPT_DIAG | OPT_ECHO;
++	// the rest are not settings a user has any reason to change: the
++	// extended memory board is always present here, MOVSU works, and the
++	// serial console is always echoed to the monitor
++	return OPT_EMB | OPT_WORK | OPT_MOVSU | OPT_ECHO | m_opt->read();
+ }
+ 
+ ROM_START(sys16)
+@@ -329,4 +732,4 @@ ROM_END
+ } // anonymous namespace
+ 
+ /*   YEAR  NAME   PARENT  COMPAT  MACHINE  INPUT  CLASS        INIT  COMPANY                   FULLNAME  FLAGS */
+-COMP(1983, sys16, 0,      0,      sys16,   sys16, sys16_state, init, "National Semiconductor", "SYS16",  MACHINE_NOT_WORKING | MACHINE_NO_SOUND_HW)
++COMP(1983, sys16, 0,      0,      sys16,   sys16, sys16_state, init, "National Semiconductor", "SYS16",  MACHINE_NO_SOUND_HW)

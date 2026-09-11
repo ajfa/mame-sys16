@@ -1,0 +1,77 @@
+From 45bef9d95279b2d4602cc0889eae1df32277918b Mon Sep 17 00:00:00 2001
+From: ajfa <3520832+ajfa@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 19:15:56 -0600
+Subject: [PATCH 3/6] sys16: wire the disk and console interrupts
+
+icuinit programs ELTG 0xcbe5 and TPL 0x2040, so line 3 (disk) is edge
+triggered on the falling edge and lines 9 and 10 (console receive and
+transmit) are active low.  The ROM monitor polls the disk and never needed
+this; the kernel sleeps waiting for the interrupt, which is where the boot
+stopped after reading the superblock.
+
+GENIX V.2 now reaches INIT: SINGLE USER MODE and an interactive shell.
+---
+ src/devices/cpu/ns32000/ns32000.cpp | 5 +----
+ src/mame/natsemi/sys16.cpp          | 9 +++++++--
+ 2 files changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/src/devices/cpu/ns32000/ns32000.cpp b/src/devices/cpu/ns32000/ns32000.cpp
+index f42ffb4c..a155d4a5 100644
+--- a/src/devices/cpu/ns32000/ns32000.cpp
++++ b/src/devices/cpu/ns32000/ns32000.cpp
+@@ -4001,10 +4001,7 @@ template <int HighBits, int Width> void ns32000_device<HighBits, Width>::execute
+ 				if (machine().debug_enabled())
+ 					machine().debug_break();
+ 				else
+-				{
+-					logerror("abort during abort entry 0x%08x\n", m_pc);
+-					suspend(SUSPEND_REASON_HALT, true);
+-				}
++					fatalerror("abort during abort entry 0x%08x\n", m_pc);
+ 			}
+ 		}
+ 	}
+diff --git a/src/mame/natsemi/sys16.cpp b/src/mame/natsemi/sys16.cpp
+index 90667d97..bfec1105 100644
+--- a/src/mame/natsemi/sys16.cpp
++++ b/src/mame/natsemi/sys16.cpp
+@@ -265,6 +265,7 @@ void sys16_state::machine_reset()
+ 	m_dcu_selftest = false;
+ 	m_dcu_auxerr = false;
+ 	m_dcu_unit = 0;
++	m_icu->ir_w<3>(1); // idle high
+ 
+ 	m_boot.select(0);
+ }
+@@ -341,6 +342,8 @@ void sys16_state::sys16(machine_config &config)
+ 	m_pit->out_handler<2>().set(m_icu, FUNC(ns32202_device::ir_w<1>));
+ 
+ 	SCN2651(config, m_pci, 1.8432_MHz_XTAL); // INS2651N
++	m_pci->rxrdy_handler().set(m_icu, FUNC(ns32202_device::ir_w<9>)).invert();
++	m_pci->txrdy_handler().set(m_icu, FUNC(ns32202_device::ir_w<10>)).invert();
+ 
+ 	RS232_PORT(config, m_console, default_rs232_devices, "terminal");
+ 	m_console->rxd_handler().set(m_pci, FUNC(scn2651_device::rxd_w));
+@@ -431,7 +434,7 @@ void sys16_state::dcu_w(offs_t offset, u8 data)
+ 
+ 	case 4: // any write acknowledges the completed operation
+ 		m_dcu_code = DCU_IDLE;
+-		m_icu->ir_w<3>(0);
++		m_icu->ir_w<3>(1);
+ 		break;
+ 
+ 	case 8: // error acknowledge
+@@ -448,7 +451,9 @@ TIMER_CALLBACK_MEMBER(sys16_state::dcu_complete)
+ 	bool const ok = dcu_execute();
+ 
+ 	m_dcu_code = ok ? DCU_DONE : DCU_ERROR;
+-	m_icu->ir_w<3>(1);
++
++	// ICU line 3 is edge triggered on the falling edge
++	m_icu->ir_w<3>(0);
+ }
+ 
+ bool sys16_state::dcu_execute()
+-- 
+2.34.1
+

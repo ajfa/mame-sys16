@@ -1,0 +1,55 @@
+From 4b083c93216becd1b215c8f394d834aed938eb03 Mon Sep 17 00:00:00 2001
+From: ajfa <3520832+ajfa@users.noreply.github.com>
+Date: Thu, 10 Sep 2026 20:40:21 -0600
+Subject: [PATCH 5/6] sys16: it is no longer a non-working skeleton
+
+It boots GENIX V.2 from disk and runs it interactively on the console, so
+MACHINE_NOT_WORKING no longer describes it, and the warning screen that
+flag puts in front of every session is no longer earned.  What is still
+missing is listed in the header where a reader will find it: the tape
+board, the eight line serial board, the printer and GPIB ports, and the
+fact that the disk board is emulated at its command interface rather than
+at the level of its bit slices.
+---
+ src/mame/natsemi/sys16.cpp | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/src/mame/natsemi/sys16.cpp b/src/mame/natsemi/sys16.cpp
+index 2a3bf6b7..9e5be286 100644
+--- a/src/mame/natsemi/sys16.cpp
++++ b/src/mame/natsemi/sys16.cpp
+@@ -7,13 +7,21 @@
+  * Sources:
+  *  - NS16000 Databook, National Semiconductor Corporation, 1983 (OEE1894, DA-RRD35M94)
+  *
++ * Boots GENIX V.2 (National's port of AT&T UNIX System V Release 2) from
++ * the disk and runs it interactively on the serial console.
++ *
+  * TODO:
+- *  - gpib, printer ports
+- *  - sio/disk/tape boards
++ *  - gpib and printer ports
++ *  - tape control unit at 0xd00200
++ *  - the eight line serial board at 0xa00000, so no extra terminals and
++ *    therefore no multiuser mode
++ *  - the disk control unit is emulated at the level of its command
++ *    interface rather than its hardware: the board is a pair of AM2901 bit
++ *    slices running microcode out of RAM which was never dumped
+  *
+  * WIP:
+- *  - multiple startup diagnostic tests failing
+- *  - can exit and run monitor
++ *  - the power-up diagnostics for the boards above fail, as they should;
++ *    they are switched off by default in the machine configuration
+  *
+  *  p/f test                notes
+  *   p  0 - timer
+@@ -685,4 +693,4 @@ ROM_END
+ } // anonymous namespace
+ 
+ /*   YEAR  NAME   PARENT  COMPAT  MACHINE  INPUT  CLASS        INIT  COMPANY                   FULLNAME  FLAGS */
+-COMP(1983, sys16, 0,      0,      sys16,   sys16, sys16_state, init, "National Semiconductor", "SYS16",  MACHINE_NOT_WORKING | MACHINE_NO_SOUND_HW)
++COMP(1983, sys16, 0,      0,      sys16,   sys16, sys16_state, init, "National Semiconductor", "SYS16",  MACHINE_NO_SOUND_HW)
+-- 
+2.34.1
+
